@@ -32,14 +32,22 @@ a validación referencial, y `AuthSession` es rotativa/purgable.
 
 ## Endpoints HTTP
 
-Todos los endpoints (excepto `/audit/health`) requieren el header `x-api-key`.
+Las rutas de `/audit/...` van con el prefijo de versión (`app.setGlobalPrefix('api')` +
+`enableVersioning` en `main.ts`, `defaultVersion: '1'`) → `/api/v1/audit/...`. `/health` está
+excluido del prefijo `api` (`exclude: ['health']`) y no lleva versión.
+
+Todos los endpoints bajo `/api/v1/audit/...` — **incluido** `/api/v1/audit/health`, el guard
+(`ApiKeyGuard`) se aplica a nivel de controller sin excepción por ruta — requieren el header
+`x-api-key` cuando `AUDIT_API_KEY` tiene valor configurado; si está vacío, el guard es permisivo
+(modo desarrollo).
 
 | Método | Ruta | Descripción |
 |--------|------|-------------|
-| GET | `/audit/events` | Consultar eventos con filtros |
-| GET | `/audit/trace/:traceId` | Traza completa — todos los eventos de un request |
-| GET | `/audit/session/:sessionId` | Sesión + eventos + tokens |
-| GET | `/audit/health` | Health check (sin autenticación) |
+| GET | `/health` | Health check global del servicio (fuera de `/audit`, sin API key, sin prefijo de versión) |
+| GET | `/api/v1/audit/events` | Consultar eventos con filtros |
+| GET | `/api/v1/audit/trace/:traceId` | Traza completa — todos los eventos de un request |
+| GET | `/api/v1/audit/session/:sessionId` | Sesión + eventos + tokens |
+| GET | `/api/v1/audit/health` | Health check específico del módulo de auditoría |
 
 ### Autenticación — API Key
 
@@ -57,7 +65,7 @@ x-api-key: mi-clave-secreta-interna
 - Si `AUDIT_API_KEY` tiene valor: cualquier request sin el header o con clave incorrecta recibe `401 Unauthorized`
 - En producción **siempre** configurar un valor largo y aleatorio
 
-### Filtros disponibles en GET /audit/events
+### Filtros disponibles en GET /api/v1/audit/events
 
 | Parámetro | Tipo | Descripción |
 |-----------|------|-------------|
@@ -78,22 +86,25 @@ x-api-key: mi-clave-secreta-interna
 KEY=mi-clave-secreta-interna
 
 # Todos los logins fallidos
-curl -H "x-api-key: $KEY" "http://localhost:10400/audit/events?eventType=LOGIN_FAILED"
+curl -H "x-api-key: $KEY" "http://localhost:10400/api/v1/audit/events?eventType=LOGIN_FAILED"
 
 # Logins fallidos en un rango de fechas
-curl -H "x-api-key: $KEY" "http://localhost:10400/audit/events?eventType=LOGIN_FAILED&from=2026-01-01T00:00:00Z&to=2026-01-31T23:59:59Z"
+curl -H "x-api-key: $KEY" "http://localhost:10400/api/v1/audit/events?eventType=LOGIN_FAILED&from=2026-01-01T00:00:00Z&to=2026-01-31T23:59:59Z"
 
 # Seguir un request a través de todos los microservicios
-curl -H "x-api-key: $KEY" "http://localhost:10400/audit/trace/abc-123-uuid"
+curl -H "x-api-key: $KEY" "http://localhost:10400/api/v1/audit/trace/abc-123-uuid"
 
 # Ver sesión completa de un usuario
-curl -H "x-api-key: $KEY" "http://localhost:10400/audit/session/session-uuid-aqui"
+curl -H "x-api-key: $KEY" "http://localhost:10400/api/v1/audit/session/session-uuid-aqui"
 
 # Eventos de un usuario específico (últimos 50)
-curl -H "x-api-key: $KEY" "http://localhost:10400/audit/events?userId=user-uuid&limit=50"
+curl -H "x-api-key: $KEY" "http://localhost:10400/api/v1/audit/events?userId=user-uuid&limit=50"
 
-# Health check (sin key)
-curl "http://localhost:10400/audit/health"
+# Health check del módulo de auditoría (requiere x-api-key igual que el resto, salvo AUDIT_API_KEY vacío)
+curl -H "x-api-key: $KEY" "http://localhost:10400/api/v1/audit/health"
+
+# Health check global del servicio (sin key, sin prefijo de versión)
+curl "http://localhost:10400/health"
 ```
 
 ## Variables de entorno
@@ -150,22 +161,50 @@ docker compose -f docker-compose.dev.yml down
 
 Si SQL Server corre en tu máquina, usar `DB_HOST=host.docker.internal` en `.env`. `KAFKA_BROKER` en `.env` puede ser cualquier valor — dentro del contenedor siempre se usa `kafka:9092` (red interna Docker).
 
-### Producción
+### Producción (con Vault)
 
-El `docker-compose.yml` lee los secretos desde Vault al arrancar. No se necesita `.env` en el servidor.
+El `docker-compose.yml` inyecta `VAULT_TOKEN` vía `env_file: .env.docker` (no como variable de entorno
+exportada); `entrypoint.sh` usa ese token para leer el resto de los secretos directamente desde Vault
+al arrancar. **No se necesita `.env`** con los secretos de la app.
 
 **Requisito:** Vault corriendo en `192.168.42.44:8200` (ver [HCE-vault-config](../HCE-vault-config/README.md)).
 
-```bash
-# El token está en HCE-vault-config/.env como TOKEN_LOGS_SERVICE
-export VAULT_TOKEN=hvs.xxxx
+#### Paso 1 — Obtener el token
 
+El archivo `HCE-vault-config/.env` tiene la línea:
+```
+TOKEN_LOGS_SERVICE=hvs.CAESIDsn...
+```
+Copia ese valor.
+
+#### Paso 2 — Crear `.env.docker` con el token
+
+Este archivo tiene **una sola línea** con el token de bootstrap. No contiene secretos de la app — esos vienen del vault.
+
+**PowerShell (Windows):**
+```powershell
+"VAULT_TOKEN=hvs.CAESIDsn..." | Out-File -Encoding utf8 .env.docker
+```
+
+**Bash / Linux / Mac:**
+```bash
+echo "VAULT_TOKEN=hvs.CAESIDsn..." > .env.docker
+```
+
+> `.env.docker` está en `.gitignore` — nunca se commitea.
+> Si el init regenera los tokens, actualizar este archivo con el nuevo valor de `TOKEN_LOGS_SERVICE`.
+
+#### Paso 3 — Levantar
+
+```bash
 docker compose down
 docker compose build
 docker compose up -d
 ```
 
-Al arrancar, `entrypoint.sh` obtiene `DB_PASS`, `DB_HOST`, `KAFKA_EXTERNAL_HOST` y el resto de Vault. `KAFKA_BROKER=kafka:9092` lo fija el `docker-compose.yml` directamente (red interna Docker, no viene de Vault).
+Al arrancar, `entrypoint.sh` obtiene `DB_PASS`, `DB_HOST`, `KAFKA_EXTERNAL_HOST`, `AUDIT_API_KEY`,
+`AUDIT_PAYLOAD_KEY` y el resto desde Vault (`hce/nestjs/tch-audit-logger`). `KAFKA_BROKER=kafka:9092`
+lo fija el `docker-compose.yml` directamente (red interna Docker, no viene de Vault).
 
 > **Nota:** `AUDIT_API_KEY` y `AUDIT_PAYLOAD_KEY` también deben agregarse a Vault (`secret/hce/nestjs/tch-audit-logger`) antes del primer deploy en producción.
 
